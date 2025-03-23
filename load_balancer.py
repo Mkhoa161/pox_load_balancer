@@ -154,6 +154,17 @@ class LoadBalancer(object):
         else:
             log.info(f"Mapping {server_ip} to port 6")
             return 6  # Assuming h6 is connected to port 6
+        
+    def get_client_port(self, client_ip):
+        # This function should return the switch port connected to the client
+        # For simplicity, assume clients are connected to ports 1-4
+        client_ports = {
+            IPAddr("10.0.0.1"): 1,
+            IPAddr("10.0.0.2"): 2,
+            IPAddr("10.0.0.3"): 3,
+            IPAddr("10.0.0.4"): 4,
+        }
+        return client_ports.get(client_ip, None)
 
 def launch():
     core.registerNew(LoadBalancer)
