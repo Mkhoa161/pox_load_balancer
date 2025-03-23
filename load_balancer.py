@@ -2,7 +2,9 @@ from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import IPAddr, EthAddr
 from pox.lib.packet.arp import arp
-from pox.lib.packet.ethernet import ethernet
+from pox.lib.packet.ethernet import ethernet, IP_TYPE, ARP_TYPE
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.icmp import icmp
 
 log = core.getLogger()
 
@@ -29,7 +31,7 @@ class LoadBalancer(object):
             return
 
         # Handle ARP requests
-        if packet.type == packet.ARP_TYPE:
+        if packet.type == ARP_TYPE:
             arp_packet = packet.payload
             requested_ip = arp_packet.protodst
 
@@ -48,7 +50,7 @@ class LoadBalancer(object):
                 arp_reply.protodst = arp_packet.protosrc
 
                 ether = ethernet()
-                ether.type = ethernet.ARP_TYPE
+                ether.type = ARP_TYPE
                 ether.src = SERVER_MACS[selected_server]
                 ether.dst = arp_packet.hwsrc
                 ether.payload = arp_reply
@@ -61,6 +63,26 @@ class LoadBalancer(object):
 
                 # Install OpenFlow rules for the selected server
                 self.install_rules(event, requested_ip, SERVER_IPS[selected_server], SERVER_MACS[selected_server])
+
+        # Handle ICMP (ping) traffic
+        elif packet.type == IP_TYPE:
+            ip_packet = packet.payload
+            if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
+                icmp_packet = ip_packet.payload
+                if isinstance(icmp_packet, icmp):
+                    # Check if the destination IP is a virtual IP
+                    if ip_packet.dstip not in SERVER_IPS:
+                        # Forward the packet to the selected server
+                        selected_server = current_server
+                        current_server = (current_server + 1) % len(SERVER_IPS)
+
+                        # Rewrite the destination IP to the selected server's IP
+                        msg = of.ofp_packet_out()
+                        msg.data = packet.pack()
+                        msg.actions.append(of.ofp_action_dl_addr.set_dst(SERVER_MACS[selected_server]))
+                        msg.actions.append(of.ofp_action_nw_addr.set_dst(SERVER_IPS[selected_server]))
+                        msg.actions.append(of.ofp_action_output(port=self.get_server_port(SERVER_IPS[selected_server])))
+                        event.connection.send(msg)
 
     def install_rules(self, event, virtual_ip, server_ip, server_mac):
         # Rule for traffic from client to server
@@ -78,7 +100,7 @@ class LoadBalancer(object):
         msg.match.in_port = self.get_server_port(server_ip)
         msg.match.dl_type = ethernet.IP_TYPE
         msg.match.nw_src = server_ip
-        msg.match.nw_dst = packet.next.protosrc
+        msg.match.nw_dst = virtual_ip
         msg.actions.append(of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:00")))  # Virtual MAC
         msg.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip))  # Rewrite source IP to virtual IP
         msg.actions.append(of.ofp_action_output(port=event.port))
@@ -86,11 +108,10 @@ class LoadBalancer(object):
 
     def get_server_port(self, server_ip):
         # This function should return the switch port connected to the server
-        # You can hardcode this or dynamically discover it
         if server_ip == SERVER_IPS[0]:
-            return 5  # Assuming h5 is connected to port 5
+            return 5  
         else:
-            return 6  # Assuming h6 is connected to port 6
+            return 6 
 
 def launch():
     core.registerNew(LoadBalancer)
