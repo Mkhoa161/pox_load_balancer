@@ -96,31 +96,24 @@ class VirtualIPLoadBalancer:
         """
         Handles incoming ICMP requests and forwards them to h5 or h6.
         """
-        log.info("--Handle Request--")
         ip_packet = packet.next
-        client_ip = ip_packet.srcip  # Get client IP
-        selected_server = self.servers[self.current_server]  # Choose server (h5/h6)
-        self.current_server = (self.current_server + 1) % len(self.servers)  # Round-robin
+        client_ip = ip_packet.srcip
+        virtual_ip = ip_packet.dstip
 
-        self.client_ports[client_ip] = event.port  # Store client port
+        if client_ip in self.client_ports and virtual_ip not in [s["ip"] for s in self.servers]:
+            selected_server = None
+            for server in self.servers:
+                if server['ip'] == packet.next.dstip:
+                    selected_server = server
+                    break
+            if selected_server is None:
+                selected_server = self.servers[self.current_server]
+                self.current_server = (self.current_server + 1) % len(self.servers)
 
-        # Install OpenFlow rule to forward ICMP request to h5/h6
-        msg = of.ofp_flow_mod()
-        msg.match.in_port = event.port  # Match client port
-        msg.match.dl_type = 0x0800  # Match IPv4 packets
-        msg.match.nw_proto = ipv4.ICMP_PROTOCOL  # Match ICMP (ping)
-        msg.match.nw_src = client_ip  # Match source IP
-        msg.match.nw_dst = ip_packet.dstip  # Original destination IP
-
-        # Rewrite destination IP & MAC to selected server
-        msg.actions.append(of.ofp_action_nw_addr.set_dst(selected_server["ip"]))
-        msg.actions.append(of.ofp_action_dl_addr.set_dst(selected_server["mac"]))
-
-        # Forward packet to server
-        msg.actions.append(of.ofp_action_output(port=event.port))  
-        self.connection.send(msg)
-
-        log.info("Ping from %s redirected to %s", client_ip, selected_server["ip"])
+            self._install_flow_rules(event.port, client_ip, selected_server, virtual_ip)
+            log.info(f"ICMP request from {client_ip} redirected to {selected_server['ip']} for virtual IP {virtual_ip}")
+        else:
+            log.warning(f"ICMP request from {client_ip} to {ip_packet.dstip} dropped, no client port found.")
 
     def _handle_icmp_reply(self, event, packet):
         ip_packet = packet.next
