@@ -15,7 +15,7 @@ SERVER_MACS = [EthAddr("00:00:00:00:00:05"), EthAddr("00:00:00:00:00:06")]
 # Round-robin counter
 current_server = 0
 
-# Cache to store client MAC addresses and selected servers
+# Cache to store client MAC addresses, selected servers and requested IP addresses
 client_cache = {}  # Format: {client_ip: {"mac": client_mac, "server": selected_server. "requested_ip": requested_ip}}
 
 class LoadBalancer(object):
@@ -26,6 +26,19 @@ class LoadBalancer(object):
         self.connection = event.connection
 
     def _handle_PacketIn(self, event):
+        """
+        Handle incoming packets from the switch.
+
+        Processes ARP and ICMP packets:
+        - For ARP requests:
+            - From clients: Responds with the MAC address of a server selected in round-robin fashion.
+            - From servers: Responds with the MAC address of the client to enable reverse communication.
+        - For ICMP echo requests: Forwards packets to the server assigned to the client.
+        - For ICMP echo replies: Rewrites the source IP to the virtual IP before forwarding to the client.
+        
+        Args:
+            event (ofp_event.EventOFPPacketIn): The event object containing the incoming packet and metadata.
+        """
         global current_server
 
         packet = event.parsed
@@ -34,7 +47,7 @@ class LoadBalancer(object):
             return
 
         # Handle ARP requests
-        if packet.type == 0x0806:  # ARP type
+        if packet.type == 0x0806:
             arp_packet = packet.payload
             requested_ip = arp_packet.protodst
             client_ip = arp_packet.protosrc
@@ -47,16 +60,16 @@ class LoadBalancer(object):
 
                 # Create ARP reply with the cached client's MAC address
                 arp_reply = arp()
-                arp_reply.hwsrc = client_cache[requested_ip]["mac"]  # Client's MAC address
-                arp_reply.hwdst = arp_packet.hwsrc  # Server's MAC address
+                arp_reply.hwsrc = client_cache[requested_ip]["mac"]
+                arp_reply.hwdst = arp_packet.hwsrc
                 arp_reply.opcode = arp.REPLY
-                arp_reply.protosrc = requested_ip  # Client's IP
-                arp_reply.protodst = arp_packet.protosrc  # Server's IP
+                arp_reply.protosrc = requested_ip
+                arp_reply.protodst = arp_packet.protosrc
 
                 ether = ethernet()
-                ether.type = 0x0806  # ARP type
-                ether.src = client_cache[requested_ip]["mac"]  # Client's MAC address
-                ether.dst = arp_packet.hwsrc  # Server's MAC address
+                ether.type = 0x0806
+                ether.src = client_cache[requested_ip]["mac"]
+                ether.dst = arp_packet.hwsrc
                 ether.payload = arp_reply
 
                 # Send ARP reply
@@ -80,16 +93,16 @@ class LoadBalancer(object):
 
                 # Create ARP reply with the selected server's MAC address
                 arp_reply = arp()
-                arp_reply.hwsrc = SERVER_MACS[selected_server]  # Server's MAC address
-                arp_reply.hwdst = client_mac  # Client's MAC address
+                arp_reply.hwsrc = SERVER_MACS[selected_server]
+                arp_reply.hwdst = client_mac
                 arp_reply.opcode = arp.REPLY
-                arp_reply.protosrc = requested_ip  # Virtual IP
-                arp_reply.protodst = client_ip  # Client's IP
+                arp_reply.protosrc = requested_ip
+                arp_reply.protodst = client_ip
 
                 ether = ethernet()
-                ether.type = 0x0806  # ARP type
-                ether.src = SERVER_MACS[selected_server]  # Server's MAC address
-                ether.dst = client_mac  # Client's MAC address
+                ether.type = 0x0806
+                ether.src = SERVER_MACS[selected_server]
+                ether.dst = client_mac
                 ether.payload = arp_reply
 
                 # Send ARP reply
@@ -100,7 +113,7 @@ class LoadBalancer(object):
                 log.info(f"Sent ARP reply: {requested_ip} is-at {SERVER_MACS[selected_server]}")
 
         # Handle ICMP (ping) traffic
-        elif packet.type == 0x0800:  # IPv4 type
+        elif packet.type == 0x0800:
             ip_packet = packet.payload
             if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
                 icmp_packet = ip_packet.payload
@@ -115,7 +128,6 @@ class LoadBalancer(object):
                             client_mac = client_cache[client_ip]["mac"]
                             log.info(f"Forwarding ICMP echo reply from server {server_ip} to client {client_ip}")
 
-                            # Rewrite the source IP to the virtual IP
                             msg = of.ofp_packet_out()
                             msg.data = packet.pack()
                             msg.actions.append(of.ofp_action_nw_addr.set_src(client_cache[client_ip]["requested_ip"]))  # Rewrite source IP to virtual IP
@@ -135,7 +147,6 @@ class LoadBalancer(object):
                             selected_server = client_cache[client_ip]["server"]
                             log.info(f"Using cached server {SERVER_IPS[selected_server]} for client {client_ip}")
 
-                            # Rewrite the destination IP to the selected server's IP
                             msg = of.ofp_packet_out()
                             msg.data = packet.pack()
                             msg.actions.append(of.ofp_action_dl_addr.set_dst(SERVER_MACS[selected_server]))
@@ -147,17 +158,16 @@ class LoadBalancer(object):
                             log.warning(f"No cached server found for client {client_ip}")
 
     def get_server_port(self, server_ip):
-        # This function should return the switch port connected to the server
+        """Return the switch port connected to the server."""
         if server_ip == SERVER_IPS[0]:
             log.info(f"Mapping {server_ip} to port 5")
-            return 5  # Assuming h5 is connected to port 5
+            return 5
         else:
             log.info(f"Mapping {server_ip} to port 6")
-            return 6  # Assuming h6 is connected to port 6
+            return 6
         
     def get_client_port(self, client_ip):
-        # This function should return the switch port connected to the client
-        # For simplicity, assume clients are connected to ports 1-4
+        """Return the switch port connected to the client."""
         client_ports = {
             IPAddr("10.0.0.1"): 1,
             IPAddr("10.0.0.2"): 2,
