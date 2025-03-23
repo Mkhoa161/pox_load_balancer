@@ -40,8 +40,34 @@ class LoadBalancer(object):
             client_ip = arp_packet.protosrc
             client_mac = packet.src
 
+
+            # Check if the ARP request is from a server for a client's IP
+            if requested_ip in client_cache and arp_packet.protosrc in SERVER_IPS:
+                log.info(f"ARP request from server {arp_packet.protosrc} for client IP: {requested_ip}")
+
+                # Create ARP reply with the cached client's MAC address
+                arp_reply = arp()
+                arp_reply.hwsrc = client_cache[requested_ip]["mac"]  # Client's MAC address
+                arp_reply.hwdst = arp_packet.hwsrc  # Server's MAC address
+                arp_reply.opcode = arp.REPLY
+                arp_reply.protosrc = requested_ip  # Client's IP
+                arp_reply.protodst = arp_packet.protosrc  # Server's IP
+
+                ether = ethernet()
+                ether.type = 0x0806  # ARP type
+                ether.src = client_cache[requested_ip]["mac"]  # Client's MAC address
+                ether.dst = arp_packet.hwsrc  # Server's MAC address
+                ether.payload = arp_reply
+
+                # Send ARP reply
+                msg = of.ofp_packet_out()
+                msg.data = ether.pack()
+                msg.actions.append(of.ofp_action_output(port=event.port))
+                event.connection.send(msg)
+                log.info(f"Sent ARP reply: {requested_ip} is-at {client_cache[requested_ip]['mac']}")
+
             # Check if the ARP request is for the virtual IP
-            if requested_ip not in SERVER_IPS:
+            else:
                 log.info(f"ARP request for virtual IP: {requested_ip} from client: {client_ip}")
 
                 # Select the next server in round-robin fashion
@@ -72,31 +98,6 @@ class LoadBalancer(object):
                 msg.actions.append(of.ofp_action_output(port=event.port))
                 event.connection.send(msg)
                 log.info(f"Sent ARP reply: {requested_ip} is-at {SERVER_MACS[selected_server]}")
-
-            # Check if the ARP request is from a server for a client's IP
-            elif requested_ip in client_cache and arp_packet.protosrc in SERVER_IPS:
-                log.info(f"ARP request from server {arp_packet.protosrc} for client IP: {requested_ip}")
-
-                # Create ARP reply with the cached client's MAC address
-                arp_reply = arp()
-                arp_reply.hwsrc = client_cache[requested_ip]["mac"]  # Client's MAC address
-                arp_reply.hwdst = arp_packet.hwsrc  # Server's MAC address
-                arp_reply.opcode = arp.REPLY
-                arp_reply.protosrc = requested_ip  # Client's IP
-                arp_reply.protodst = arp_packet.protosrc  # Server's IP
-
-                ether = ethernet()
-                ether.type = 0x0806  # ARP type
-                ether.src = client_cache[requested_ip]["mac"]  # Client's MAC address
-                ether.dst = arp_packet.hwsrc  # Server's MAC address
-                ether.payload = arp_reply
-
-                # Send ARP reply
-                msg = of.ofp_packet_out()
-                msg.data = ether.pack()
-                msg.actions.append(of.ofp_action_output(port=event.port))
-                event.connection.send(msg)
-                log.info(f"Sent ARP reply: {requested_ip} is-at {client_cache[requested_ip]['mac']}")
 
         # Handle ICMP (ping) traffic
         elif packet.type == 0x0800:  # IPv4 type
