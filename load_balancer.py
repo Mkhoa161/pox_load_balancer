@@ -21,6 +21,7 @@ class LoadBalancer:
         """
         Handles incoming packets and processes ICMP (ping) requests.
         """
+        log.info("--Handle incoming packet--")
         packet = event.parsed  # Parse the packet
         
         if isinstance(packet.next, ipv4):  # Check if it's an IPv4 packet
@@ -35,6 +36,7 @@ class LoadBalancer:
         """
         Handles incoming ICMP requests and forwards them to h5 or h6.
         """
+        log.info("--Handle Request--")
         ip_packet = packet.next
         client_ip = ip_packet.srcip  # Get client IP
         selected_server = self.servers[self.current_server]  # Choose server (h5/h6)
@@ -64,6 +66,7 @@ class LoadBalancer:
         """
         Handles ICMP replies from h5/h6 and rewrites them back to the original destination.
         """
+        log.info("--Handle Reply--")
         ip_packet = packet.next
         server_ip = ip_packet.srcip  # Get real server IP
         client_ip = ip_packet.dstip  # Get original client IP
