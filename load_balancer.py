@@ -2,7 +2,7 @@ from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import IPAddr, EthAddr
 from pox.lib.packet.arp import arp
-from pox.lib.packet.ethernet import ethernet, IP_TYPE, ARP_TYPE
+from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.icmp import icmp
 
@@ -31,7 +31,7 @@ class LoadBalancer(object):
             return
 
         # Handle ARP requests
-        if packet.type == ARP_TYPE:
+        if packet.type == 0x0806:
             arp_packet = packet.payload
             requested_ip = arp_packet.protodst
 
@@ -50,7 +50,7 @@ class LoadBalancer(object):
                 arp_reply.protodst = arp_packet.protosrc
 
                 ether = ethernet()
-                ether.type = ARP_TYPE
+                ether.type = 0x0806
                 ether.src = SERVER_MACS[selected_server]
                 ether.dst = arp_packet.hwsrc
                 ether.payload = arp_reply
@@ -65,7 +65,7 @@ class LoadBalancer(object):
                 self.install_rules(event, requested_ip, SERVER_IPS[selected_server], SERVER_MACS[selected_server])
 
         # Handle ICMP (ping) traffic
-        elif packet.type == IP_TYPE:
+        elif packet.type == 0x0800:
             ip_packet = packet.payload
             if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
                 icmp_packet = ip_packet.payload
