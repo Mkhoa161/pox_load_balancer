@@ -31,13 +31,13 @@ class LoadBalancer(object):
             return
 
         # Handle ARP requests
-        if packet.type == 0x0806:
+        if packet.type == 0x0806:  # ARP type
             arp_packet = packet.payload
             requested_ip = arp_packet.protodst
 
             # Check if the requested IP is not a real server IP
             if requested_ip not in SERVER_IPS:
-                # Select the next server in round-robin fashion
+                log.info(f"ARP request for virtual IP: {requested_ip}")
                 selected_server = current_server
                 current_server = (current_server + 1) % len(SERVER_IPS)
 
@@ -50,7 +50,7 @@ class LoadBalancer(object):
                 arp_reply.protodst = arp_packet.protosrc
 
                 ether = ethernet()
-                ether.type = 0x0806
+                ether.type = 0x0806  # ARP type
                 ether.src = SERVER_MACS[selected_server]
                 ether.dst = arp_packet.hwsrc
                 ether.payload = arp_reply
@@ -60,19 +60,20 @@ class LoadBalancer(object):
                 msg.data = ether.pack()
                 msg.actions.append(of.ofp_action_output(port=event.port))
                 event.connection.send(msg)
+                log.info(f"Sent ARP reply: {requested_ip} is-at {SERVER_MACS[selected_server]}")
 
                 # Install OpenFlow rules for the selected server
                 self.install_rules(event, requested_ip, SERVER_IPS[selected_server], SERVER_MACS[selected_server])
 
         # Handle ICMP (ping) traffic
-        elif packet.type == 0x0800:
+        elif packet.type == 0x0800:  # IPv4 type
             ip_packet = packet.payload
             if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
                 icmp_packet = ip_packet.payload
                 if isinstance(icmp_packet, icmp):
                     # Check if the destination IP is a virtual IP
                     if ip_packet.dstip not in SERVER_IPS:
-                        # Forward the packet to the selected server
+                        log.info(f"ICMP packet for virtual IP: {ip_packet.dstip}")
                         selected_server = current_server
                         current_server = (current_server + 1) % len(SERVER_IPS)
 
@@ -83,34 +84,39 @@ class LoadBalancer(object):
                         msg.actions.append(of.ofp_action_nw_addr.set_dst(SERVER_IPS[selected_server]))
                         msg.actions.append(of.ofp_action_output(port=self.get_server_port(SERVER_IPS[selected_server])))
                         event.connection.send(msg)
+                        log.info(f"Forwarded ICMP packet to {SERVER_IPS[selected_server]}")
 
     def install_rules(self, event, virtual_ip, server_ip, server_mac):
         # Rule for traffic from client to server
         msg = of.ofp_flow_mod()
         msg.match.in_port = event.port
-        msg.match.dl_type = ethernet.IP_TYPE
+        msg.match.dl_type = 0x0800  # IPv4 type
         msg.match.nw_dst = virtual_ip  # Match the virtual IP
         msg.actions.append(of.ofp_action_dl_addr.set_dst(server_mac))
         msg.actions.append(of.ofp_action_nw_addr.set_dst(server_ip))
         msg.actions.append(of.ofp_action_output(port=self.get_server_port(server_ip)))
         event.connection.send(msg)
+        log.info(f"Installed rule: {virtual_ip} -> {server_ip} (port {self.get_server_port(server_ip)})")
 
         # Rule for traffic from server to client
         msg = of.ofp_flow_mod()
         msg.match.in_port = self.get_server_port(server_ip)
-        msg.match.dl_type = ethernet.IP_TYPE
+        msg.match.dl_type = 0x0800  # IPv4 type
         msg.match.nw_src = server_ip
         msg.match.nw_dst = virtual_ip
         msg.actions.append(of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:00")))  # Virtual MAC
         msg.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip))  # Rewrite source IP to virtual IP
         msg.actions.append(of.ofp_action_output(port=event.port))
         event.connection.send(msg)
+        log.info(f"Installed rule: {server_ip} -> {virtual_ip} (port {event.port})")
 
     def get_server_port(self, server_ip):
         # This function should return the switch port connected to the server
         if server_ip == SERVER_IPS[0]:
+            log.info(f"Mapping {server_ip} to port 5")
             return 5  
         else:
+            log.info(f"Mapping {server_ip} to port 6")
             return 6 
 
 def launch():
