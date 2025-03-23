@@ -16,7 +16,7 @@ SERVER_MACS = [EthAddr("00:00:00:00:00:05"), EthAddr("00:00:00:00:00:06")]
 current_server = 0
 
 # Cache to store client MAC addresses and selected servers
-client_cache = {}  # Format: {client_ip: {"mac": client_mac, "server": selected_server}}
+client_cache = {}  # Format: {client_ip: {"mac": client_mac, "server": selected_server. "requested_ip": requested_ip}}
 
 class LoadBalancer(object):
     def __init__(self):
@@ -75,7 +75,7 @@ class LoadBalancer(object):
                 current_server = (current_server + 1) % len(SERVER_IPS)
 
                 # Cache the client's MAC address and selected server
-                client_cache[client_ip] = {"mac": client_mac, "server": selected_server}
+                client_cache[client_ip] = {"mac": client_mac, "server": selected_server, "requested_ip": requested_ip}
                 log.info(f"Cached client: {client_ip} -> MAC: {client_mac}, Server: {SERVER_IPS[selected_server]}")
 
                 # Create ARP reply with the selected server's MAC address
@@ -105,8 +105,28 @@ class LoadBalancer(object):
             if ip_packet.protocol == ipv4.ICMP_PROTOCOL:
                 icmp_packet = ip_packet.payload
                 if isinstance(icmp_packet, icmp):
+                    # Check if the packet is an ICMP echo reply
+                    if ip_packet.srcip in SERVER_IPS:
+                        server_ip = ip_packet.srcip
+                        client_ip = ip_packet.dstip
+
+                        # Retrieve the cached client MAC address
+                        if client_ip in client_cache:
+                            client_mac = client_cache[client_ip]["mac"]
+                            log.info(f"Forwarding ICMP echo reply from server {server_ip} to client {client_ip}")
+
+                            # Rewrite the source IP to the virtual IP
+                            msg = of.ofp_packet_out()
+                            msg.data = packet.pack()
+                            msg.actions.append(of.ofp_action_nw_addr.set_src(client_cache[client_ip]["requested_ip"]))  # Rewrite source IP to virtual IP
+                            msg.actions.append(of.ofp_action_output(port=self.get_client_port(client_ip)))
+                            event.connection.send(msg)
+                            log.info(f"Forwarded ICMP echo reply to client {client_ip}")
+                        else:
+                            log.warning(f"No cached client MAC found for IP: {client_ip}")
+                    
                     # Check if the destination IP is a virtual IP
-                    if ip_packet.dstip not in SERVER_IPS:
+                    elif ip_packet.dstip not in SERVER_IPS:
                         client_ip = ip_packet.srcip
                         client_mac = packet.src
 
