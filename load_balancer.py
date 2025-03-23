@@ -1,100 +1,148 @@
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import IPAddr, EthAddr
-from pox.lib.packet import ipv4, icmp
+from pox.lib.packet import arp, ethernet, ipv4, icmp
 
 log = core.getLogger()
 
-class LoadBalancer:
+class VirtualIPLoadBalancer:
     def __init__(self, connection):
-        self.connection = connection  # Store switch connection
-        self.servers = [  # List of backend servers (h5 & h6)
+        self.connection = connection
+        self.servers = [
             {"ip": IPAddr("10.0.0.5"), "mac": EthAddr("00:00:00:00:00:05")},
             {"ip": IPAddr("10.0.0.6"), "mac": EthAddr("00:00:00:00:00:06")},
         ]
-        self.client_ports = {}  # Store client-port mappings
-        self.current_server = 0  # Round-robin counter
+        self.client_ports = {}
+        self.virtual_mac = EthAddr("00:00:00:00:00:10")
+        self.current_server = 0
 
-        connection.addListeners(self)  # Listen for OpenFlow events
+        connection.addListeners(self)
 
     def _handle_PacketIn(self, event):
-        """
-        Handles incoming packets and processes ICMP (ping) requests.
-        """
-        log.info("--Handle incoming packet--")
-        packet = event.parsed  # Parse the packet
-        
-        if isinstance(packet.next, ipv4):  # Check if it's an IPv4 packet
+        packet = event.parsed
+
+        if packet.type == packet.ARP_TYPE:
+            self._handle_arp(event, packet)
+        elif isinstance(packet.next, ipv4):
             ip_packet = packet.next
-            if isinstance(ip_packet.next, icmp):  # If it's an ICMP packet
-                if ip_packet.srcip in [s["ip"] for s in self.servers]:  
-                    self.handle_reply(event, packet)  # If from h5/h6, handle reply
+            if isinstance(ip_packet.next, icmp):
+                if ip_packet.srcip in [s["ip"] for s in self.servers]:
+                    self._handle_icmp_reply(event, packet)
                 else:
-                    self.handle_request(event, packet)  # Otherwise, balance the request
+                    self._handle_icmp_request(event, packet)
 
-    def handle_request(self, event, packet):
-        """
-        Handles incoming ICMP requests and forwards them to h5 or h6.
-        """
-        log.info("--Handle Request--")
+    def _handle_arp(self, event, packet):
+        arp_packet = packet.payload
+        if arp_packet.protodst not in [s["ip"] for s in self.servers]: #handle all arp request that are not for servers.
+            arp_reply = arp()
+            arp_reply.hwtype = arp_packet.hwtype
+            arp_reply.prototype = arp_packet.prototype
+            arp_reply.hwlen = arp_packet.hwlen
+            arp_reply.protolen = arp_packet.protolen
+            arp_reply.opcode = arp.REPLY
+            arp_reply.hwdst = arp_packet.hwsrc
+            arp_reply.protodst = arp_packet.protosrc
+            arp_reply.hwsrc = self.virtual_mac
+            arp_reply.protosrc = arp_packet.protodst #send the virtual address back.
+
+            eth = ethernet()
+            eth.src = self.virtual_mac
+            eth.dst = packet.src
+            eth.type = ethernet.ARP_TYPE
+            eth.payload = arp_reply
+
+            msg = of.ofp_packet_out()
+            msg.data = eth.pack()
+            msg.actions.append(of.ofp_action_output(port=event.port))
+            self.connection.send(msg)
+
+            selected_server = self.servers[self.current_server]
+            self.current_server = (self.current_server + 1) % len(self.servers)
+
+            client_ip = arp_packet.protosrc
+            self.client_ports[client_ip] = event.port
+
+            self._install_flow_rules(event.port, client_ip, selected_server, arp_packet.protodst) #use the destination IP.
+            log.info(f"ARP request from {client_ip} mapped to {selected_server['ip']} for virtual IP {arp_packet.protodst}")
+
+        elif arp_packet.protosrc in [s["ip"] for s in self.servers]:
+            #handle ARP request from servers.
+            client_ip = arp_packet.protodst
+            if client_ip in self.client_ports:
+                dest_port = self.client_ports[client_ip]
+                arp_reply = arp()
+                arp_reply.hwtype = arp_packet.hwtype
+                arp_reply.prototype = arp_packet.prototype
+                arp_reply.hwlen = arp_packet.hwlen
+                arp_reply.protolen = arp_packet.protolen
+                arp_reply.opcode = arp.REPLY
+                arp_reply.hwdst = arp_packet.hwsrc
+                arp_reply.protodst = arp_packet.protosrc
+                arp_reply.hwsrc = self.virtual_mac
+                arp_reply.protosrc = arp_packet.protodst
+
+                eth = ethernet()
+                eth.src = self.virtual_mac
+                eth.dst = packet.src
+                eth.type = ethernet.ARP_TYPE
+                eth.payload = arp_reply
+
+                msg = of.ofp_packet_out()
+                msg.data = eth.pack()
+                msg.actions.append(of.ofp_action_output(port=event.port))
+                self.connection.send(msg)
+
+    def _handle_icmp_request(self, event, packet):
+        pass #handeled in arp request.
+
+    def _handle_icmp_reply(self, event, packet):
         ip_packet = packet.next
-        client_ip = ip_packet.srcip  # Get client IP
-        selected_server = self.servers[self.current_server]  # Choose server (h5/h6)
-        self.current_server = (self.current_server + 1) % len(self.servers)  # Round-robin
+        server_ip = ip_packet.srcip
+        client_ip = ip_packet.dstip
+        if client_ip in self.client_ports:
+            msg = of.ofp_flow_mod()
+            msg.match.in_port = event.port
+            msg.match.dl_type = 0x0800
+            msg.match.nw_proto = ipv4.ICMP_PROTOCOL
+            msg.match.nw_src = server_ip
+            msg.match.nw_dst = client_ip
 
-        self.client_ports[client_ip] = event.port  # Store client port
+            msg.actions.append(of.ofp_action_nw_addr.set_src(ip_packet.dstip)) #send the virtual address back.
+            msg.actions.append(of.ofp_action_dl_addr.set_src(self.virtual_mac))
+            msg.actions.append(of.ofp_action_output(port=self.client_ports[client_ip]))
+            self.connection.send(msg)
+            log.info(f"ICMP reply from {server_ip} rewritten to {ip_packet.dstip}")
 
-        # Install OpenFlow rule to forward ICMP request to h5/h6
+    def _install_flow_rules(self, in_port, client_ip, server, virtual_ip):
+        # Client to Server
         msg = of.ofp_flow_mod()
-        msg.match.in_port = event.port  # Match client port
-        msg.match.dl_type = 0x0800  # Match IPv4 packets
-        msg.match.nw_proto = ipv4.ICMP_PROTOCOL  # Match ICMP (ping)
-        msg.match.nw_src = client_ip  # Match source IP
-        msg.match.nw_dst = ip_packet.dstip  # Original destination IP
+        msg.match.in_port = in_port
+        msg.match.dl_type = 0x0800
+        msg.match.nw_proto = ipv4.ICMP_PROTOCOL
+        msg.match.nw_dst = virtual_ip
+        msg.match.nw_src = client_ip
 
-        # Rewrite destination IP & MAC to selected server
-        msg.actions.append(of.ofp_action_nw_addr.set_dst(selected_server["ip"]))
-        msg.actions.append(of.ofp_action_dl_addr.set_dst(selected_server["mac"]))
-
-        # Forward packet to server
-        msg.actions.append(of.ofp_action_output(port=event.port))  
+        msg.actions.append(of.ofp_action_nw_addr.set_dst(server["ip"]))
+        msg.actions.append(of.ofp_action_dl_addr.set_dst(server["mac"]))
+        msg.actions.append(of.ofp_action_output(port=self.connection.ports[server["mac"]]))
         self.connection.send(msg)
 
-        log.info("Ping from %s redirected to %s", client_ip, selected_server["ip"])
-
-    def handle_reply(self, event, packet):
-        """
-        Handles ICMP replies from h5/h6 and rewrites them back to the original destination.
-        """
-        log.info("--Handle Reply--")
-        ip_packet = packet.next
-        server_ip = ip_packet.srcip  # Get real server IP
-        client_ip = ip_packet.dstip  # Get original client IP
-
-        # Install OpenFlow rule to rewrite the reply source
+        # Server to Client
         msg = of.ofp_flow_mod()
-        msg.match.in_port = event.port  # Match server port
-        msg.match.dl_type = 0x0800  # Match IPv4
-        msg.match.nw_proto = ipv4.ICMP_PROTOCOL  # Match ICMP
-        msg.match.nw_src = server_ip  # Match real server IP
-        msg.match.nw_dst = client_ip  # Match client IP
+        msg.match.in_port = self.connection.ports[server["mac"]]
+        msg.match.dl_type = 0x0800
+        msg.match.nw_proto = ipv4.ICMP_PROTOCOL
+        msg.match.nw_src = server["ip"]
+        msg.match.nw_dst = client_ip
 
-        # Rewrite source IP & MAC to original destination
-        msg.actions.append(of.ofp_action_nw_addr.set_src(ip_packet.dstip))
-        msg.actions.append(of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:10")))  # Fake MAC for VIP
-
-        # Forward packet to client
-        msg.actions.append(of.ofp_action_output(port=self.client_ports[client_ip]))  
+        msg.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip))
+        msg.actions.append(of.ofp_action_dl_addr.set_src(self.virtual_mac))
+        msg.actions.append(of.ofp_action_output(port=in_port))
         self.connection.send(msg)
-
-        log.info("Ping reply from %s rewritten to original IP %s", server_ip, ip_packet.dstip)
 
 def launch():
-    """
-    Starts the POX controller application.
-    """
     def start_switch(event):
-        log.info("Starting Ping Load Balancer on switch %s", event.connection)
-        LoadBalancer(event.connection)  # Attach the load balancer to the switch
+        log.info(f"Starting Virtual IP Load Balancer on switch {event.connection}")
+        VirtualIPLoadBalancer(event.connection)
 
-    core.openflow.addListenerByName("ConnectionUp", start_switch)  # Listen for switch connection
+    core.openflow.addListenerByName("ConnectionUp", start_switch)
